@@ -50,6 +50,9 @@ async fn main() -> color_eyre::Result<()> {
 fn build_branch_graph() -> color_eyre::Result<Graph> {
     let mut graph = Graph::default();
 
+    // jj log --no-graph -r 'bookmarks()' -T 'bookmarks ++ "\n"'
+    // jj log --no-graph -r 'children(test) & bookmarks()' -T 'bookmarks ++ "\n"'
+
     let mut branches = command(
         "jj",
         [

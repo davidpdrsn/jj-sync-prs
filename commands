@@ -1,0 +1,27 @@
+jj log --no-graph -r 'bookmarks()' -T 'bookmarks ++ "\n"'
+
+jj log --no-graph -r 'children(push-wtqmqortkzry) & bookmarks()' -T 'bookmarks ++ "\n"'
+
+jj log --no-graph -r '..push-wtqmqortkzry & ..ng-3088-button-to-create-windows-from-window-notes'
+
+jj log --no-graph -r '..bookmarks()'
+
+jj log --no-graph -r 'root().. & bookmarks()'
+
+jj -r 'main---::'
+
+jj log --no-graph -T 'change_id ++ "\n"'
+
+jj log --no-graph -r 'children(ztzxrsrskxmyopropwxolytvzwlmlylu, 1)' -T 'change_id ++ " " ++ bookmarks ++ "\n"'
+
+jj log --no-graph -r 'ztzxrsrskxmyopropwxolytvzwlmlylu' -T 'change_id ++ " " ++ bookmarks ++ "\n"'
+
+ztzxrsrskxmyopropwxolytvzwlmlylu
+
+push-wtqmqortkzry
+ng-3088-button-to-create-windows-from-window-notes
+david/debug-menu-for-camera-layers
+david/port-ruler-to-new-snapping-25-07-04
+david/move-snapping-into-core-state
+david/simplify-coordinate-spaces
+main

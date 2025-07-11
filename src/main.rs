@@ -1,6 +1,9 @@
 use std::fmt::Write;
+use std::pin::pin;
 use std::{ffi::OsStr, path::Path};
 
+use clap::Parser;
+use color_eyre::eyre::ContextCompat;
 use futures::TryStreamExt as _;
 use octocrab::{Octocrab, models::pulls::PullRequest};
 use serde::Deserialize;
@@ -9,8 +12,16 @@ use crate::graph::Graph;
 
 mod graph;
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(short, long)]
+    create_new: bool,
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    let cli = Cli::parse();
+
     let graph = build_branch_graph()?;
 
     let repo_info = repo_info()?;
@@ -20,7 +31,7 @@ async fn main() -> color_eyre::Result<()> {
     let octocrab = octocrab::OctocrabBuilder::default()
         .personal_token(token)
         .build()?;
-    let pulls = octocrab
+    let mut pulls = octocrab
         .pulls(&repo_info.owner, &repo_info.name)
         .list()
         .send()
@@ -29,66 +40,67 @@ async fn main() -> color_eyre::Result<()> {
         .try_collect::<Vec<_>>()
         .await?;
 
+    let mut commands = Vec::new();
+
     for stack_root in graph.iter_edges_from("main") {
         let mut comment_lines = Vec::new();
         write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
 
-        process_branch(
-            stack_root,
-            &graph,
-            &pulls,
-            &comment_lines,
-            &octocrab,
-            &repo_info,
-        )
-        .await?;
+        process_branch(&mut commands, stack_root, "main", &graph, &comment_lines);
+    }
+
+    for command in commands {
+        if let Err(err) = run_command(&command, &mut pulls, &octocrab, &repo_info, &cli).await {
+            eprintln!("❌ {command:?} failed: {err:#}");
+        }
     }
 
     Ok(())
 }
 
 fn build_branch_graph() -> color_eyre::Result<Graph> {
-    let mut graph = Graph::default();
-
-    // jj log --no-graph -r 'bookmarks()' -T 'bookmarks ++ "\n"'
-    // jj log --no-graph -r 'children(test) & bookmarks()' -T 'bookmarks ++ "\n"'
-
-    let mut branches = command(
-        "jj",
-        [
-            "log",
-            "--no-graph",
-            "-r",
-            "bookmarks()",
-            "-T",
-            "bookmarks ++ \"\\n\"",
-        ],
-    )?
-    .lines()
-    .map(|s| s.to_owned())
-    .collect::<Vec<_>>();
-    branches.reverse();
-
-    for parent in branches {
-        let parent_node = graph.get_or_insert(&parent);
-
-        let children = command(
+    fn go(graph: &mut Graph, change: &str, parent_branch: &str) -> color_eyre::Result<()> {
+        let output = command(
             "jj",
             [
                 "log",
                 "--no-graph",
                 "-r",
-                &format!("children({parent}) & bookmarks()"),
+                &format!("children({change}, 1)"),
                 "-T",
-                "bookmarks ++ \"\\n\"",
+                "change_id ++ \" \" ++ bookmarks ++ \"\n\"",
             ],
         )?;
 
-        for child in children.lines() {
-            let child_node = graph.get_or_insert(child);
-            graph.add_edge(parent_node, child_node);
+        for line in output.lines() {
+            let (change, branch) = if let Some((change, branch)) = line.trim().split_once(' ') {
+                (change, Some(branch.trim_matches('*')))
+            } else {
+                (line, None)
+            };
+
+            if let Some(branch) = branch {
+                if parent_branch != branch {
+                    let parent_branch_node = graph.get_or_insert(parent_branch);
+                    let branch_node = graph.get_or_insert(branch);
+                    graph.add_edge(parent_branch_node, branch_node);
+                }
+                go(graph, change, branch)?;
+            } else {
+                go(graph, change, parent_branch)?;
+            }
         }
+
+        Ok(())
     }
+
+    let mut graph = Graph::default();
+
+    let output = command("jj", ["log", "--no-graph", "-T", "change_id ++ \"\n\""])?;
+    let mut output = output.lines();
+    let common_ancestor = output.next_back().context("no lines")?;
+
+    go(&mut graph, common_ancestor, "main")?;
 
     Ok(graph)
 }
@@ -145,7 +157,7 @@ fn write_pr_comment(graph: &Graph, branch: &str, indent: usize, out: &mut Vec<Co
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CommentLine {
     branch: String,
     indent: usize,
@@ -154,11 +166,11 @@ struct CommentLine {
 impl CommentLine {
     fn format(
         &self,
-        branch: &str,
+        head_branch: &str,
         pulls: &[PullRequest],
         out: &mut String,
     ) -> color_eyre::Result<()> {
-        let Some((pull_title, pull_url)) = pulls
+        let (pull_title, pull_url) = pulls
             .iter()
             .find(|pull| pull.head.ref_field == self.branch)
             .and_then(|pull| {
@@ -166,9 +178,7 @@ impl CommentLine {
                 let title = pull.title.as_deref()?;
                 Some((title, url))
             })
-        else {
-            color_eyre::eyre::bail!("no pr");
-        };
+            .with_context(|| format!("PR from {} not found", self.branch))?;
 
         for c in std::iter::repeat_n(' ', self.indent) {
             write!(out, "{c}").unwrap();
@@ -176,7 +186,7 @@ impl CommentLine {
         write!(out, "- ").unwrap();
 
         write!(out, "[{pull_title}]({pull_url})").unwrap();
-        if branch == self.branch {
+        if head_branch == self.branch {
             write!(out, " 👈 you are here").unwrap();
         }
 
@@ -186,26 +196,93 @@ impl CommentLine {
 
 const ID: &str = "e39f85cc-4589-41f7-9bae-d491c1ee2eda";
 
-async fn process_branch(
+#[derive(Debug)]
+enum Commands {
+    FindOrCreatePr {
+        target: String,
+        branch: String,
+    },
+    CreateOrUpdateComment {
+        comment_lines: Vec<CommentLine>,
+        branch: String,
+    },
+}
+
+fn process_branch(
+    commands: &mut Vec<Commands>,
     branch: &str,
+    target: &str,
     graph: &Graph,
-    pulls: &[PullRequest],
     comment_lines: &[CommentLine],
+) {
+    commands.push(Commands::FindOrCreatePr {
+        branch: branch.to_owned(),
+        target: target.to_owned(),
+    });
+    if comment_lines.len() > 1 {
+        commands.push(Commands::CreateOrUpdateComment {
+            branch: branch.to_owned(),
+            comment_lines: comment_lines.to_vec(),
+        });
+    }
+
+    for child in graph.iter_edges_from(branch) {
+        process_branch(commands, child, branch, graph, comment_lines);
+    }
+}
+
+async fn run_command(
+    command: &Commands,
+    pulls: &mut Vec<PullRequest>,
     octocrab: &Octocrab,
     repo_info: &RepoInfo,
+    cli: &Cli,
 ) -> color_eyre::Result<()> {
-    if let Some(pull) = pulls.iter().find(|pull| pull.head.ref_field == branch) {
-        let mut comment = "This pull request is part of a stack:\n".to_owned();
-        for line in comment_lines {
-            if line.format(branch, pulls, &mut comment).is_ok() {
-                comment.push('\n');
+    match command {
+        Commands::FindOrCreatePr { target, branch } => {
+            if let Some((idx, pull)) = pulls
+                .iter()
+                .enumerate()
+                .find(|(_, pull)| pull.head.ref_field == **branch)
+            {
+                if pull.base.ref_field != **target {
+                    eprintln!(
+                        "updating target of PR from {branch} from {} to {target}",
+                        pull.base.ref_field
+                    );
+                    let updated = octocrab
+                        .pulls(&repo_info.owner, &repo_info.name)
+                        .update(pull.number)
+                        .base(target)
+                        .send()
+                        .await?;
+                    pulls[idx] = updated;
+                }
+            } else if cli.create_new {
+                eprintln!("creating PR from {branch} into {target}");
+                let pull = octocrab
+                    .pulls(&repo_info.owner, &repo_info.name)
+                    .create(&**branch, target, &**branch)
+                    .draft(true)
+                    .send()
+                    .await?;
+                pulls.push(pull);
+            } else {
+                eprintln!("skipping creating PR from {branch} into {target}");
             }
         }
-        comment.push_str("-------\n");
-        write!(comment, "_This comment was auto-generated (id: {ID})_").unwrap();
+        Commands::CreateOrUpdateComment {
+            comment_lines,
+            branch,
+        } => {
+            let pull = pulls
+                .iter()
+                .find(|pull| pull.head.ref_field == *branch)
+                .with_context(|| format!("PR from {branch} not found"))?;
 
-        let mut stream = std::pin::pin!(
-            octocrab
+            let comment = finalize_comment(branch, comment_lines, pulls)?;
+
+            let comment_stream = octocrab
                 .issues(&repo_info.owner, &repo_info.name)
                 .list_comments(pull.number)
                 .send()
@@ -213,45 +290,44 @@ async fn process_branch(
                 .into_stream(octocrab)
                 .try_filter(|comment| {
                     std::future::ready(comment.body.as_ref().is_some_and(|body| body.contains(ID)))
-                })
-        );
+                });
 
-        if let Some(existing_comment) = stream.try_next().await? {
-            if existing_comment.body.is_none_or(|body| body != comment) {
+            if let Some(existing_comment) = pin!(comment_stream).try_next().await? {
+                if existing_comment.body.is_none_or(|body| body != comment) {
+                    octocrab
+                        .issues(&repo_info.owner, &repo_info.name)
+                        .update_comment(existing_comment.id, comment)
+                        .await?;
+                    if let Some(url) = &pull.html_url {
+                        eprintln!("updated comment on {url}");
+                    }
+                }
+            } else {
                 octocrab
-                    .issues("lun-energy", "web-main")
-                    .update_comment(existing_comment.id, comment)
+                    .issues(&repo_info.owner, &repo_info.name)
+                    .create_comment(pull.number, comment)
                     .await?;
                 if let Some(url) = &pull.html_url {
-                    println!("Updated comment on {url}");
+                    eprintln!("created comment on {url}");
                 }
-            } else if let Some(url) = &pull.html_url {
-                println!("{url} is up to date");
-            }
-        } else {
-            octocrab
-                .issues("lun-energy", "web-main")
-                .create_comment(pull.number, comment)
-                .await?;
-            if let Some(url) = &pull.html_url {
-                println!("Created comment on {url}");
             }
         }
-    } else {
-        println!("`{branch}` has no pull request");
-    }
-
-    for child in graph.iter_edges_from(branch) {
-        Box::pin(process_branch(
-            child,
-            graph,
-            pulls,
-            comment_lines,
-            octocrab,
-            repo_info,
-        ))
-        .await?;
     }
 
     Ok(())
+}
+
+fn finalize_comment(
+    branch: &str,
+    comment_lines: &[CommentLine],
+    pulls: &[PullRequest],
+) -> color_eyre::Result<String> {
+    let mut comment = "This pull request is part of a stack:\n".to_owned();
+    for line in comment_lines {
+        line.format(branch, pulls, &mut comment)?;
+        comment.push('\n');
+    }
+    comment.push_str("-------\n");
+    write!(comment, "_This comment was auto-generated (id: {ID})_").unwrap();
+    Ok(comment)
 }

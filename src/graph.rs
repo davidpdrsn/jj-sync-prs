@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 #[derive(Debug, Default)]
 pub struct Graph {
@@ -6,6 +9,7 @@ pub struct Graph {
     edges: BTreeMap<usize, BTreeSet<usize>>,
 }
 
+#[allow(dead_code)]
 impl Graph {
     pub fn get_or_insert(&mut self, node: &str) -> usize {
         for (idx, n) in self.nodes.iter().enumerate() {
@@ -51,5 +55,22 @@ impl Graph {
                     (&**node, child)
                 })
         })
+    }
+
+    pub fn to_dot(&self) -> String {
+        let mut out = String::new();
+
+        writeln!(&mut out, "digraph Workflow {{").unwrap();
+        for (i, node) in self.nodes.iter().enumerate() {
+            writeln!(&mut out, "    {i} [label=\"{node}\"];").unwrap();
+        }
+        for (from, edges) in &self.edges {
+            for to in edges {
+                writeln!(&mut out, "    {from} -> {to};").unwrap();
+            }
+        }
+        writeln!(&mut out, "}}").unwrap();
+
+        out
     }
 }

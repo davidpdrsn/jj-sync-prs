@@ -1,9 +1,10 @@
 [package]
-name = "jj-create-prs"
+name = "jj-sync-prs"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5.41", features = ["derive"] }
 color-eyre = "0.6.5"
 futures = "0.3.31"
 octocrab = { version = "0.44.1", features = ["stream"] }

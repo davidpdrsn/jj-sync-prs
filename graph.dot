@@ -1,0 +1,15 @@
+digraph Workflow {
+    0 [label="main"];
+    1 [label="david/simplify-coordinate-spaces"];
+    2 [label="david/move-snapping-into-core-state"];
+    3 [label="david/port-ruler-to-new-snapping-25-07-04"];
+    4 [label="david/debug-menu-for-camera-layers"];
+    5 [label="ng-3088-button-to-create-windows-from-window-notes"];
+    6 [label="push-wtqmqortkzry"];
+    0 -> 1;
+    1 -> 2;
+    2 -> 3;
+    3 -> 4;
+    4 -> 5;
+    5 -> 6;
+}

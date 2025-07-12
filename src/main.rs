@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::pin::pin;
 use std::{ffi::OsStr, path::Path};
 
-use clap::Parser;
 use color_eyre::eyre::{Context as _, ContextCompat};
+use dialoguer::{Confirm, Editor};
 use futures::TryStreamExt as _;
 use octocrab::{Octocrab, models::pulls::PullRequest};
 use serde::Deserialize;
@@ -12,17 +12,9 @@ use crate::graph::Graph;
 
 mod graph;
 
-#[derive(Parser, Debug)]
-struct Cli {
-    #[arg(short, long)]
-    create_new: bool,
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-
-    let cli = Cli::parse();
 
     let graph = build_branch_graph().context("failed to build graph")?;
 
@@ -47,7 +39,7 @@ async fn main() -> color_eyre::Result<()> {
 
     for stack_root in graph.iter_edges_from("main") {
         find_or_create_prs(
-            stack_root, "main", &graph, &repo_info, &octocrab, &cli, &mut pulls,
+            stack_root, "main", &graph, &repo_info, &octocrab, &mut pulls,
         )
         .await
         .context("failed to sync prs")?;
@@ -221,16 +213,15 @@ async fn find_or_create_prs(
     graph: &Graph,
     repo_info: &RepoInfo,
     octocrab: &Octocrab,
-    cli: &Cli,
     pulls: &mut Vec<PullRequest>,
 ) -> color_eyre::Result<()> {
-    find_or_create_pr(target, branch, pulls, octocrab, repo_info, cli)
+    find_or_create_pr(target, branch, pulls, octocrab, repo_info)
         .await
         .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;
 
     for child in graph.iter_edges_from(branch) {
         Box::pin(find_or_create_prs(
-            child, branch, graph, repo_info, octocrab, cli, pulls,
+            child, branch, graph, repo_info, octocrab, pulls,
         ))
         .await
         .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;
@@ -260,7 +251,6 @@ async fn find_or_create_pr(
     pulls: &mut Vec<PullRequest>,
     octocrab: &Octocrab,
     repo_info: &RepoInfo,
-    cli: &Cli,
 ) -> color_eyre::Result<()> {
     if let Some((idx, pull)) = pulls
         .iter()
@@ -290,14 +280,25 @@ async fn find_or_create_pr(
                 })?;
             pulls[idx] = updated;
         }
-    } else if cli.create_new {
-        let pull = octocrab
-            .pulls(&repo_info.owner, &repo_info.name)
-            .create(branch, branch, target)
-            .draft(true)
-            .send()
-            .await
-            .with_context(|| format!("failed to create PR from {target}<-{branch}"))?;
+    } else if Confirm::new()
+        .with_prompt(format!(
+            "PR from {target}<-{branch} doesn't exist. Do you want to create it?"
+        ))
+        .default(true)
+        .interact()?
+    {
+        let repo_pulls = octocrab.pulls(&repo_info.owner, &repo_info.name);
+
+        let pull = if let Some((title, body)) = get_pr_title_and_body()? {
+            repo_pulls.create(title, branch, target).body(body)
+        } else {
+            repo_pulls.create(branch, branch, target)
+        }
+        .draft(true)
+        .send()
+        .await
+        .with_context(|| format!("failed to create PR from {target}<-{branch}"))?;
+
         if let Some(url) = &pull.html_url {
             eprintln!("Created PR from {target}<-{branch}: {url}");
         } else {
@@ -382,4 +383,20 @@ async fn create_or_update_comment(
     }
 
     Ok(())
+}
+
+fn get_pr_title_and_body() -> color_eyre::Result<Option<(String, String)>> {
+    if let Some(text) = Editor::new()
+        .extension(".md")
+        .edit("Enter PR title...\n\n...and description here")?
+    {
+        let mut lines = text.lines();
+        let Some(title) = lines.next() else {
+            return Ok(None);
+        };
+        let msg = lines.skip(1).collect::<Vec<_>>().join("\n");
+        Ok(Some((title.to_owned(), msg)))
+    } else {
+        Ok(None)
+    }
 }

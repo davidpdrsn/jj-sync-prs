@@ -56,16 +56,21 @@ async fn main() -> color_eyre::Result<()> {
     for stack_root in graph.iter_edges_from("main") {
         let mut comment_lines = Vec::new();
         write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
-        create_or_update_comments(
-            &comment_lines,
-            stack_root,
-            &graph,
-            &pulls,
-            &octocrab,
-            &repo_info,
-        )
-        .await
-        .context("failed to sync stack comment")?;
+
+        if comment_lines.len() > 1 {
+            // if the comment contains just one line then its not
+            // part of a stack
+            create_or_update_comments(
+                &comment_lines,
+                stack_root,
+                &graph,
+                &pulls,
+                &octocrab,
+                &repo_info,
+            )
+            .await
+            .context("failed to sync stack comment")?;
+        }
     }
 
     Ok(())
@@ -81,7 +86,7 @@ fn build_branch_graph() -> color_eyre::Result<Graph> {
                 "-r",
                 &format!("children({change}, 1)"),
                 "-T",
-                "change_id ++ \" \" ++ bookmarks ++ \"\n\"",
+                "change_id ++ \" \" ++ local_bookmarks ++ \"\n\"",
             ],
         )?;
 
@@ -286,7 +291,6 @@ async fn find_or_create_pr(
             pulls[idx] = updated;
         }
     } else if cli.create_new {
-        eprintln!("creating PR from {target}<-{branch}");
         let pull = octocrab
             .pulls(&repo_info.owner, &repo_info.name)
             .create(branch, branch, target)
@@ -294,6 +298,11 @@ async fn find_or_create_pr(
             .send()
             .await
             .with_context(|| format!("failed to create PR from {target}<-{branch}"))?;
+        if let Some(url) = &pull.html_url {
+            eprintln!("Created PR from {target}<-{branch}: {url}");
+        } else {
+            eprintln!("Created PR from {target}<-{branch}");
+        }
         pulls.push(pull);
     } else {
         eprintln!("skipping creating PR from {target}<-{branch}");
@@ -361,9 +370,7 @@ async fn create_or_update_comment(
                 .update_comment(existing_comment.id, comment)
                 .await
                 .context("failed to update comment")?;
-            if let Some(url) = &pull.html_url {
-                eprintln!("updated comment on {url}");
-            }
+            eprintln!("updated comment on #{}", pull.number);
         }
     } else {
         octocrab
@@ -371,9 +378,7 @@ async fn create_or_update_comment(
             .create_comment(pull.number, comment)
             .await
             .context("failed to create comment")?;
-        if let Some(url) = &pull.html_url {
-            eprintln!("created comment on {url}");
-        }
+        eprintln!("created comment on #{}", pull.number);
     }
 
     Ok(())

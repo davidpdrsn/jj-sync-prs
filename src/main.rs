@@ -3,7 +3,7 @@ use std::pin::pin;
 use std::{ffi::OsStr, path::Path};
 
 use clap::Parser;
-use color_eyre::eyre::ContextCompat;
+use color_eyre::eyre::{Context as _, ContextCompat};
 use futures::TryStreamExt as _;
 use octocrab::{Octocrab, models::pulls::PullRequest};
 use serde::Deserialize;
@@ -12,47 +12,60 @@ use crate::graph::Graph;
 
 mod graph;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct Cli {
     #[arg(short, long)]
     create_new: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
     let cli = Cli::parse();
 
-    let graph = build_branch_graph()?;
+    let graph = build_branch_graph().context("failed to build graph")?;
 
-    let repo_info = repo_info()?;
+    let repo_info = repo_info().context("failed to find repo info")?;
 
-    let token = command("gh", ["auth", "token"])?;
+    let token = command("gh", ["auth", "token"]).context("failed to find github auth token")?;
     let token = token.trim().to_owned();
     let octocrab = octocrab::OctocrabBuilder::default()
         .personal_token(token)
-        .build()?;
+        .build()
+        .context("failed to build github client")?;
     let mut pulls = octocrab
         .pulls(&repo_info.owner, &repo_info.name)
         .list()
         .send()
-        .await?
+        .await
+        .context("failed to fetch pull requests")?
         .into_stream(&octocrab)
         .try_collect::<Vec<_>>()
-        .await?;
+        .await
+        .context("failed to fetch all pull requests")?;
 
-    let mut commands = Vec::new();
+    for stack_root in graph.iter_edges_from("main") {
+        find_or_create_prs(
+            stack_root, "main", &graph, &repo_info, &octocrab, &cli, &mut pulls,
+        )
+        .await
+        .context("failed to sync prs")?;
+    }
 
     for stack_root in graph.iter_edges_from("main") {
         let mut comment_lines = Vec::new();
         write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
-
-        process_branch(&mut commands, stack_root, "main", &graph, &comment_lines);
-    }
-
-    for command in commands {
-        if let Err(err) = run_command(&command, &mut pulls, &octocrab, &repo_info, &cli).await {
-            eprintln!("❌ {command:?} failed: {err:#}");
-        }
+        create_or_update_comments(
+            &comment_lines,
+            stack_root,
+            &graph,
+            &pulls,
+            &octocrab,
+            &repo_info,
+        )
+        .await
+        .context("failed to sync stack comment")?;
     }
 
     Ok(())
@@ -124,7 +137,8 @@ fn repo_info() -> color_eyre::Result<RepoInfo> {
     }
 
     let output = command("gh", ["repo", "view", "--json", "name,owner"])?;
-    let output = serde_json::from_str::<Output>(&output)?;
+    let output =
+        serde_json::from_str::<Output>(&output).context("failed to parse json output from gh")?;
 
     Ok(RepoInfo {
         owner: output.owner.login,
@@ -143,7 +157,7 @@ where
     }
     let output = cmd.output()?;
     color_eyre::eyre::ensure!(output.status.success(), "{cmd:?} failed");
-    Ok(String::from_utf8(output.stdout)?)
+    String::from_utf8(output.stdout).context("command returned invalid utf-8")
 }
 
 fn write_pr_comment(graph: &Graph, branch: &str, indent: usize, out: &mut Vec<CommentLine>) {
@@ -196,122 +210,25 @@ impl CommentLine {
 
 const ID: &str = "e39f85cc-4589-41f7-9bae-d491c1ee2eda";
 
-#[derive(Debug)]
-enum Commands {
-    FindOrCreatePr {
-        target: String,
-        branch: String,
-    },
-    CreateOrUpdateComment {
-        comment_lines: Vec<CommentLine>,
-        branch: String,
-    },
-}
-
-fn process_branch(
-    commands: &mut Vec<Commands>,
+async fn find_or_create_prs(
     branch: &str,
     target: &str,
     graph: &Graph,
-    comment_lines: &[CommentLine],
-) {
-    commands.push(Commands::FindOrCreatePr {
-        branch: branch.to_owned(),
-        target: target.to_owned(),
-    });
-    if comment_lines.len() > 1 {
-        commands.push(Commands::CreateOrUpdateComment {
-            branch: branch.to_owned(),
-            comment_lines: comment_lines.to_vec(),
-        });
-    }
+    repo_info: &RepoInfo,
+    octocrab: &Octocrab,
+    cli: &Cli,
+    pulls: &mut Vec<PullRequest>,
+) -> color_eyre::Result<()> {
+    find_or_create_pr(target, branch, pulls, octocrab, repo_info, cli)
+        .await
+        .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;
 
     for child in graph.iter_edges_from(branch) {
-        process_branch(commands, child, branch, graph, comment_lines);
-    }
-}
-
-async fn run_command(
-    command: &Commands,
-    pulls: &mut Vec<PullRequest>,
-    octocrab: &Octocrab,
-    repo_info: &RepoInfo,
-    cli: &Cli,
-) -> color_eyre::Result<()> {
-    match command {
-        Commands::FindOrCreatePr { target, branch } => {
-            if let Some((idx, pull)) = pulls
-                .iter()
-                .enumerate()
-                .find(|(_, pull)| pull.head.ref_field == **branch)
-            {
-                if pull.base.ref_field != **target {
-                    eprintln!(
-                        "updating target of PR from {branch} from {} to {target}",
-                        pull.base.ref_field
-                    );
-                    let updated = octocrab
-                        .pulls(&repo_info.owner, &repo_info.name)
-                        .update(pull.number)
-                        .base(target)
-                        .send()
-                        .await?;
-                    pulls[idx] = updated;
-                }
-            } else if cli.create_new {
-                eprintln!("creating PR from {branch} into {target}");
-                let pull = octocrab
-                    .pulls(&repo_info.owner, &repo_info.name)
-                    .create(&**branch, target, &**branch)
-                    .draft(true)
-                    .send()
-                    .await?;
-                pulls.push(pull);
-            } else {
-                eprintln!("skipping creating PR from {branch} into {target}");
-            }
-        }
-        Commands::CreateOrUpdateComment {
-            comment_lines,
-            branch,
-        } => {
-            let pull = pulls
-                .iter()
-                .find(|pull| pull.head.ref_field == *branch)
-                .with_context(|| format!("PR from {branch} not found"))?;
-
-            let comment = finalize_comment(branch, comment_lines, pulls)?;
-
-            let comment_stream = octocrab
-                .issues(&repo_info.owner, &repo_info.name)
-                .list_comments(pull.number)
-                .send()
-                .await?
-                .into_stream(octocrab)
-                .try_filter(|comment| {
-                    std::future::ready(comment.body.as_ref().is_some_and(|body| body.contains(ID)))
-                });
-
-            if let Some(existing_comment) = pin!(comment_stream).try_next().await? {
-                if existing_comment.body.is_none_or(|body| body != comment) {
-                    octocrab
-                        .issues(&repo_info.owner, &repo_info.name)
-                        .update_comment(existing_comment.id, comment)
-                        .await?;
-                    if let Some(url) = &pull.html_url {
-                        eprintln!("updated comment on {url}");
-                    }
-                }
-            } else {
-                octocrab
-                    .issues(&repo_info.owner, &repo_info.name)
-                    .create_comment(pull.number, comment)
-                    .await?;
-                if let Some(url) = &pull.html_url {
-                    eprintln!("created comment on {url}");
-                }
-            }
-        }
+        Box::pin(find_or_create_prs(
+            child, branch, graph, repo_info, octocrab, cli, pulls,
+        ))
+        .await
+        .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;
     }
 
     Ok(())
@@ -330,4 +247,134 @@ fn finalize_comment(
     comment.push_str("-------\n");
     write!(comment, "_This comment was auto-generated (id: {ID})_").unwrap();
     Ok(comment)
+}
+
+async fn find_or_create_pr(
+    target: &str,
+    branch: &str,
+    pulls: &mut Vec<PullRequest>,
+    octocrab: &Octocrab,
+    repo_info: &RepoInfo,
+    cli: &Cli,
+) -> color_eyre::Result<()> {
+    if let Some((idx, pull)) = pulls
+        .iter()
+        .enumerate()
+        .find(|(_, pull)| pull.head.ref_field == branch)
+    {
+        if pull.base.ref_field != target {
+            eprintln!(
+                "updating target of PR #{number} from {prev_target}<-{branch} to {new_target}<-{branch}",
+                number = pull.number,
+                prev_target = pull.base.ref_field,
+                new_target = target,
+            );
+            let updated = octocrab
+                .pulls(&repo_info.owner, &repo_info.name)
+                .update(pull.number)
+                .base(target)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed updating target of PR #{number} from {prev_target}<-{branch} to {new_target}<-{branch}",
+                        number = pull.number,
+                        prev_target = pull.base.ref_field,
+                        new_target = target,
+                    )
+                })?;
+            pulls[idx] = updated;
+        }
+    } else if cli.create_new {
+        eprintln!("creating PR from {target}<-{branch}");
+        let pull = octocrab
+            .pulls(&repo_info.owner, &repo_info.name)
+            .create(branch, branch, target)
+            .draft(true)
+            .send()
+            .await
+            .with_context(|| format!("failed to create PR from {target}<-{branch}"))?;
+        pulls.push(pull);
+    } else {
+        eprintln!("skipping creating PR from {target}<-{branch}");
+    }
+
+    Ok(())
+}
+
+async fn create_or_update_comments(
+    comment_lines: &[CommentLine],
+    branch: &str,
+    graph: &Graph,
+    pulls: &[PullRequest],
+    octocrab: &Octocrab,
+    repo_info: &RepoInfo,
+) -> color_eyre::Result<()> {
+    create_or_update_comment(comment_lines, branch, pulls, octocrab, repo_info).await?;
+
+    for child in graph.iter_edges_from(branch) {
+        Box::pin(create_or_update_comments(
+            comment_lines,
+            child,
+            graph,
+            pulls,
+            octocrab,
+            repo_info,
+        ))
+        .await
+        .context("failed to sync stack comment")?;
+    }
+
+    Ok(())
+}
+
+async fn create_or_update_comment(
+    comment_lines: &[CommentLine],
+    branch: &str,
+    pulls: &[PullRequest],
+    octocrab: &Octocrab,
+    repo_info: &RepoInfo,
+) -> color_eyre::Result<()> {
+    let pull = pulls
+        .iter()
+        .find(|pull| pull.head.ref_field == *branch)
+        .with_context(|| format!("PR from {branch} not found"))?;
+
+    let comment =
+        finalize_comment(branch, comment_lines, pulls).context("failed to finalize comment")?;
+
+    let comment_stream = octocrab
+        .issues(&repo_info.owner, &repo_info.name)
+        .list_comments(pull.number)
+        .send()
+        .await
+        .context("failed to fetch comments")?
+        .into_stream(octocrab)
+        .try_filter(|comment| {
+            std::future::ready(comment.body.as_ref().is_some_and(|body| body.contains(ID)))
+        });
+
+    if let Some(existing_comment) = pin!(comment_stream).try_next().await? {
+        if existing_comment.body.is_none_or(|body| body != comment) {
+            octocrab
+                .issues(&repo_info.owner, &repo_info.name)
+                .update_comment(existing_comment.id, comment)
+                .await
+                .context("failed to update comment")?;
+            if let Some(url) = &pull.html_url {
+                eprintln!("updated comment on {url}");
+            }
+        }
+    } else {
+        octocrab
+            .issues(&repo_info.owner, &repo_info.name)
+            .create_comment(pull.number, comment)
+            .await
+            .context("failed to create comment")?;
+        if let Some(url) = &pull.html_url {
+            eprintln!("created comment on {url}");
+        }
+    }
+
+    Ok(())
 }

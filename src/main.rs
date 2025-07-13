@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::future::ready;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::pin::pin;
@@ -10,6 +11,7 @@ use dialoguer::{Confirm, Editor};
 use futures::TryStreamExt as _;
 use octocrab::{Octocrab, models::pulls::PullRequest};
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::graph::Graph;
 
@@ -39,7 +41,7 @@ enum Subcommand {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
@@ -60,14 +62,17 @@ async fn main() -> color_eyre::Result<()> {
 async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
     match subcommand {
         Subcommand::Sync { github_token } => {
-            let graph = build_branch_graph().context("failed to build graph")?;
+            let graph = tokio::task::spawn_blocking(|| {
+                build_branch_graph().context("failed to build graph")
+            });
 
             let repo_info = repo_info().context("failed to find repo info")?;
 
             let octocrab = octocrab::OctocrabBuilder::default()
-                .personal_token(github_token)
+                .personal_token(&*github_token)
                 .build()
                 .context("failed to build github client")?;
+
             let mut pulls = octocrab
                 .pulls(&repo_info.owner, &repo_info.name)
                 .list()
@@ -79,6 +84,8 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
                 .await
                 .context("failed to fetch all pull requests")?;
 
+            let graph = graph.await??;
+
             for stack_root in graph.iter_edges_from("main") {
                 find_or_create_prs(
                     stack_root, "main", &graph, &repo_info, &octocrab, &mut pulls,
@@ -86,6 +93,8 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
                 .await
                 .context("failed to sync prs")?;
             }
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1024);
 
             for stack_root in graph.iter_edges_from("main") {
                 let mut comment_lines = Vec::new();
@@ -101,11 +110,13 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
                         &pulls,
                         &octocrab,
                         &repo_info,
+                        tx.clone(),
                     )
-                    .await
                     .context("failed to sync stack comment")?;
                 }
             }
+            drop(tx);
+            while rx.recv().await.is_some() {}
         }
         Subcommand::Graph { out } => {
             let graph = build_branch_graph().context("failed to build graph")?;
@@ -372,26 +383,42 @@ async fn find_or_create_pr(
     Ok(())
 }
 
-async fn create_or_update_comments(
+fn create_or_update_comments(
     comment_lines: &[CommentLine],
     branch: &str,
     graph: &Graph,
     pulls: &[PullRequest],
     octocrab: &Octocrab,
     repo_info: &RepoInfo,
+    tx: mpsc::Sender<()>,
 ) -> color_eyre::Result<()> {
-    create_or_update_comment(comment_lines, branch, pulls, octocrab, repo_info).await?;
+    tokio::spawn({
+        let octocrab = octocrab.clone();
+        let tx = tx.clone();
+        let comment_lines = comment_lines.to_vec();
+        let branch = branch.to_owned();
+        let pulls = pulls.to_vec();
+        let repo_info = repo_info.clone();
+        async move {
+            if let Err(err) =
+                create_or_update_comment(comment_lines, branch, pulls, octocrab, repo_info).await
+            {
+                eprintln!("{err:#}");
+            }
+            drop(tx);
+        }
+    });
 
     for child in graph.iter_edges_from(branch) {
-        Box::pin(create_or_update_comments(
+        create_or_update_comments(
             comment_lines,
             child,
             graph,
             pulls,
             octocrab,
             repo_info,
-        ))
-        .await
+            tx.clone(),
+        )
         .context("failed to sync stack comment")?;
     }
 
@@ -399,11 +426,11 @@ async fn create_or_update_comments(
 }
 
 async fn create_or_update_comment(
-    comment_lines: &[CommentLine],
-    branch: &str,
-    pulls: &[PullRequest],
-    octocrab: &Octocrab,
-    repo_info: &RepoInfo,
+    comment_lines: Vec<CommentLine>,
+    branch: String,
+    pulls: Vec<PullRequest>,
+    octocrab: Octocrab,
+    repo_info: RepoInfo,
 ) -> color_eyre::Result<()> {
     let pull = pulls
         .iter()
@@ -411,7 +438,7 @@ async fn create_or_update_comment(
         .with_context(|| format!("PR from {branch} not found"))?;
 
     let comment =
-        finalize_comment(branch, comment_lines, pulls).context("failed to finalize comment")?;
+        finalize_comment(&branch, &comment_lines, &pulls).context("failed to finalize comment")?;
 
     let comment_stream = octocrab
         .issues(&repo_info.owner, &repo_info.name)
@@ -419,10 +446,8 @@ async fn create_or_update_comment(
         .send()
         .await
         .context("failed to fetch comments")?
-        .into_stream(octocrab)
-        .try_filter(|comment| {
-            std::future::ready(comment.body.as_ref().is_some_and(|body| body.contains(ID)))
-        });
+        .into_stream(&octocrab)
+        .try_filter(|comment| ready(comment.body.as_ref().is_some_and(|body| body.contains(ID))));
 
     if let Some(existing_comment) = pin!(comment_stream).try_next().await? {
         if existing_comment.body.is_none_or(|body| body != comment) {

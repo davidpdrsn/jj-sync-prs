@@ -1,7 +1,10 @@
 use std::fmt::Write;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::{ffi::OsStr, path::Path};
 
+use clap::Parser;
 use color_eyre::eyre::{Context as _, ContextCompat};
 use dialoguer::{Confirm, Editor};
 use futures::TryStreamExt as _;
@@ -12,56 +15,113 @@ use crate::graph::Graph;
 
 mod graph;
 
+#[derive(Parser, Debug)]
+#[command(name = "jj-sync-prs")]
+#[command(about = "Sync jujutsu branches with GitHub pull requests")]
+struct Args {
+    #[command(subcommand)]
+    subcommand: Option<Subcommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Subcommand {
+    /// Sync branches with pull requests
+    Sync {
+        /// GitHub authentication token
+        #[arg(long, env = "GH_AUTH_TOKEN")]
+        github_token: String,
+    },
+    /// Save the branch graph as an image
+    Graph {
+        /// File to write the image to
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    let graph = build_branch_graph().context("failed to build graph")?;
+    let args = Args::parse();
 
-    let repo_info = repo_info().context("failed to find repo info")?;
-
-    let token = command("gh", ["auth", "token"]).context("failed to find github auth token")?;
-    let token = token.trim().to_owned();
-    let octocrab = octocrab::OctocrabBuilder::default()
-        .personal_token(token)
-        .build()
-        .context("failed to build github client")?;
-    let mut pulls = octocrab
-        .pulls(&repo_info.owner, &repo_info.name)
-        .list()
-        .send()
-        .await
-        .context("failed to fetch pull requests")?
-        .into_stream(&octocrab)
-        .try_collect::<Vec<_>>()
-        .await
-        .context("failed to fetch all pull requests")?;
-
-    for stack_root in graph.iter_edges_from("main") {
-        find_or_create_prs(
-            stack_root, "main", &graph, &repo_info, &octocrab, &mut pulls,
-        )
-        .await
-        .context("failed to sync prs")?;
+    if let Some(subcommand) = args.subcommand {
+        run_subcommand(subcommand).await?;
+    } else {
+        run_subcommand(Subcommand::Sync {
+            github_token: std::env::var("GH_AUTH_TOKEN").context("GH_AUTH_TOKEN is not set")?,
+        })
+        .await?;
     }
 
-    for stack_root in graph.iter_edges_from("main") {
-        let mut comment_lines = Vec::new();
-        write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
+    Ok(())
+}
 
-        if comment_lines.len() > 1 {
-            // if the comment contains just one line then its not
-            // part of a stack
-            create_or_update_comments(
-                &comment_lines,
-                stack_root,
-                &graph,
-                &pulls,
-                &octocrab,
-                &repo_info,
-            )
-            .await
-            .context("failed to sync stack comment")?;
+async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
+    match subcommand {
+        Subcommand::Sync { github_token } => {
+            let graph = build_branch_graph().context("failed to build graph")?;
+
+            let repo_info = repo_info().context("failed to find repo info")?;
+
+            let octocrab = octocrab::OctocrabBuilder::default()
+                .personal_token(github_token)
+                .build()
+                .context("failed to build github client")?;
+            let mut pulls = octocrab
+                .pulls(&repo_info.owner, &repo_info.name)
+                .list()
+                .send()
+                .await
+                .context("failed to fetch pull requests")?
+                .into_stream(&octocrab)
+                .try_collect::<Vec<_>>()
+                .await
+                .context("failed to fetch all pull requests")?;
+
+            for stack_root in graph.iter_edges_from("main") {
+                find_or_create_prs(
+                    stack_root, "main", &graph, &repo_info, &octocrab, &mut pulls,
+                )
+                .await
+                .context("failed to sync prs")?;
+            }
+
+            for stack_root in graph.iter_edges_from("main") {
+                let mut comment_lines = Vec::new();
+                write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
+
+                if comment_lines.len() > 1 {
+                    // if the comment contains just one line then its not
+                    // part of a stack
+                    create_or_update_comments(
+                        &comment_lines,
+                        stack_root,
+                        &graph,
+                        &pulls,
+                        &octocrab,
+                        &repo_info,
+                    )
+                    .await
+                    .context("failed to sync stack comment")?;
+                }
+            }
+        }
+        Subcommand::Graph { out } => {
+            let graph = build_branch_graph().context("failed to build graph")?;
+            let dot = graph.to_dot();
+            let (read, mut write) = std::io::pipe()?;
+            let out = out.as_deref().unwrap_or_else(|| Path::new("branches.png"));
+            let mut cmd = std::process::Command::new("dot");
+            cmd.arg("-Tpng");
+            cmd.arg("-o");
+            cmd.args(out);
+            cmd.stdin(read);
+            let mut child = cmd.spawn().with_context(|| format!("{cmd:?} failed"))?;
+            write.write_all(dot.as_bytes())?;
+            drop(write);
+            color_eyre::eyre::ensure!(child.wait()?.success());
+            eprintln!("Wrote {out:?}");
         }
     }
 

@@ -60,7 +60,7 @@ impl Graph {
     pub fn to_dot(&self) -> String {
         let mut out = String::new();
 
-        writeln!(&mut out, "digraph Workflow {{").unwrap();
+        writeln!(&mut out, "digraph Branches {{").unwrap();
         for (i, node) in self.nodes.iter().enumerate() {
             writeln!(&mut out, "    {i} [label=\"{node}\"];").unwrap();
         }

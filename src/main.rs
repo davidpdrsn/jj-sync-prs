@@ -6,7 +6,7 @@ use std::pin::pin;
 use std::{ffi::OsStr, path::Path};
 
 use clap::Parser;
-use color_eyre::eyre::{Context as _, ContextCompat};
+use color_eyre::eyre::{Context as _, ContextCompat, bail};
 use dialoguer::{Confirm, Editor};
 use futures::TryStreamExt as _;
 use octocrab::{Octocrab, models::pulls::PullRequest};
@@ -360,7 +360,7 @@ async fn find_or_create_pr(
     {
         let repo_pulls = octocrab.pulls(&repo_info.owner, &repo_info.name);
 
-        let pull = if let Some((title, body)) = get_pr_title_and_body()? {
+        let pull = if let Some((title, body)) = get_pr_title_and_body(branch, target)? {
             repo_pulls.create(title, branch, target).body(body)
         } else {
             repo_pulls.create(branch, branch, target)
@@ -470,16 +470,37 @@ async fn create_or_update_comment(
     Ok(())
 }
 
-fn get_pr_title_and_body() -> color_eyre::Result<Option<(String, String)>> {
-    if let Some(text) = Editor::new()
-        .extension(".md")
-        .edit("Enter PR title...\n\n...and description here")?
-    {
+fn get_pr_title_and_body(
+    branch: &str,
+    target: &str,
+) -> color_eyre::Result<Option<(String, String)>> {
+    let body = std::fs::read_to_string(".github/pull_request_template.md")
+        .unwrap_or_else(|_| "...and description here".to_owned());
+
+    let diff = command(
+        "jj",
+        ["diff", "--git", "-r", &format!("{target}..{branch}")],
+    )?;
+
+    let ignored_marker = "Everything below this line will be ignored";
+
+    if let Some(text) = Editor::new().extension(".jjdescription").edit(&format!(
+        "Enter PR title...\n\n{body}\n\
+                JJ: {ignored_marker}\n\n{diff}"
+    ))? {
+        if text.trim().is_empty() {
+            bail!("empty PR title and description");
+        }
+
         let mut lines = text.lines();
         let Some(title) = lines.next() else {
             return Ok(None);
         };
-        let msg = lines.skip(1).collect::<Vec<_>>().join("\n");
+        let msg = lines
+            .skip(1)
+            .take_while(|line| !line.contains(ignored_marker))
+            .collect::<Vec<_>>()
+            .join("\n");
         Ok(Some((title.to_owned(), msg)))
     } else {
         Ok(None)

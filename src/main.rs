@@ -62,8 +62,10 @@ async fn main() -> color_eyre::Result<()> {
 async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
     match subcommand {
         Subcommand::Sync { github_token } => {
+            let branch_at_root_of_stack = branch_at_root_of_stack();
+
             let graph = tokio::task::spawn_blocking(|| {
-                build_branch_graph().context("failed to build graph")
+                build_branch_graph(branch_at_root_of_stack).context("failed to build graph")
             });
 
             let repo_info = repo_info().context("failed to find repo info")?;
@@ -86,9 +88,14 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
 
             let graph = graph.await??;
 
-            for stack_root in graph.iter_edges_from("main") {
+            for stack_root in graph.iter_edges_from(branch_at_root_of_stack) {
                 find_or_create_prs(
-                    stack_root, "main", &graph, &repo_info, &octocrab, &mut pulls,
+                    stack_root,
+                    branch_at_root_of_stack,
+                    &graph,
+                    &repo_info,
+                    &octocrab,
+                    &mut pulls,
                 )
                 .await
                 .context("failed to sync prs")?;
@@ -96,7 +103,7 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1024);
 
-            for stack_root in graph.iter_edges_from("main") {
+            for stack_root in graph.iter_edges_from(branch_at_root_of_stack) {
                 let mut comment_lines = Vec::new();
                 write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
 
@@ -119,7 +126,9 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
             while rx.recv().await.is_some() {}
         }
         Subcommand::Graph { out } => {
-            let graph = build_branch_graph().context("failed to build graph")?;
+            let branch_at_root_of_stack = branch_at_root_of_stack();
+            let graph =
+                build_branch_graph(branch_at_root_of_stack).context("failed to build graph")?;
             let dot = graph.to_dot();
             let (read, mut write) = std::io::pipe()?;
             let out = out.as_deref().unwrap_or_else(|| Path::new("branches.png"));
@@ -139,7 +148,7 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn build_branch_graph() -> color_eyre::Result<Graph> {
+fn build_branch_graph(branch_at_root_of_stack: &str) -> color_eyre::Result<Graph> {
     fn go(graph: &mut Graph, change: &str, parent_branch: &str) -> color_eyre::Result<()> {
         let output = command(
             "jj",
@@ -181,7 +190,7 @@ fn build_branch_graph() -> color_eyre::Result<Graph> {
     let mut output = output.lines();
     let common_ancestor = output.next_back().context("no lines")?;
 
-    go(&mut graph, common_ancestor, "main")?;
+    go(&mut graph, common_ancestor, branch_at_root_of_stack)?;
 
     Ok(graph)
 }
@@ -212,6 +221,14 @@ fn repo_info() -> color_eyre::Result<RepoInfo> {
         owner: output.owner.login,
         name: output.name,
     })
+}
+
+fn branch_at_root_of_stack() -> &'static str {
+    if command("jj", ["show", "dev"]).is_ok() {
+        "dev"
+    } else {
+        "main"
+    }
 }
 
 fn command<I>(command: &str, args: I) -> color_eyre::Result<String>

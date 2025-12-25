@@ -347,7 +347,7 @@ async fn find_or_create_pr(
     {
         if pull.base.ref_field != target {
             eprintln!(
-                "updating target of PR #{number} from {prev_target}<-{branch} to {new_target}<-{branch}",
+                "updating target of PR #{number} from {prev_target} <- {branch} to {new_target} <- {branch}",
                 number = pull.number,
                 prev_target = pull.base.ref_field,
                 new_target = target,
@@ -360,7 +360,7 @@ async fn find_or_create_pr(
                 .await
                 .with_context(|| {
                     format!(
-                        "failed updating target of PR #{number} from {prev_target}<-{branch} to {new_target}<-{branch}",
+                        "failed updating target of PR #{number} from {prev_target} <- {branch} to {new_target} <- {branch}",
                         number = pull.number,
                         prev_target = pull.base.ref_field,
                         new_target = target,
@@ -370,7 +370,7 @@ async fn find_or_create_pr(
         }
     } else if Confirm::new()
         .with_prompt(format!(
-            "PR from {target}<-{branch} doesn't exist. Do you want to create it?"
+            "PR from {target} <- {branch} doesn't exist. Do you want to create it?"
         ))
         .default(true)
         .interact()?
@@ -385,16 +385,16 @@ async fn find_or_create_pr(
         .draft(true)
         .send()
         .await
-        .with_context(|| format!("failed to create PR from {target}<-{branch}"))?;
+        .with_context(|| format!("failed to create PR from {target} <- {branch}"))?;
 
         if let Some(url) = &pull.html_url {
-            eprintln!("Created PR from {target}<-{branch}: {url}");
+            eprintln!("Created PR from {target} <- {branch}: {url}");
         } else {
-            eprintln!("Created PR from {target}<-{branch}");
+            eprintln!("Created PR from {target} <- {branch}");
         }
         pulls.push(pull);
     } else {
-        eprintln!("skipping creating PR from {target}<-{branch}");
+        eprintln!("skipping creating PR from {target} <- {branch}");
     }
 
     Ok(())

@@ -489,6 +489,8 @@ fn get_pr_title_and_body(
     branch: &str,
     target: &str,
 ) -> color_eyre::Result<Option<(String, String)>> {
+    use std::fmt::Write;
+
     let body = std::fs::read_to_string(".github/pull_request_template.md")
         .unwrap_or_else(|_| "...and description here".to_owned());
 
@@ -497,12 +499,47 @@ fn get_pr_title_and_body(
         ["diff", "--git", "-r", &format!("{target}..{branch}")],
     )?;
 
+    let count = command(
+        "jj",
+        ["log", "--count", "-r", &format!("{target}..{branch}")],
+    )?
+    .trim()
+    .parse::<i32>()?;
+
     let ignored_marker = "Everything below this line will be ignored";
 
-    if let Some(text) = Editor::new().extension(".jjdescription").edit(&format!(
-        "Enter PR title...\n\n{body}\n\
-                JJ: {ignored_marker}\n\n{diff}"
-    ))? {
+    let commit_descriptions = command(
+        "jj",
+        [
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("{target}..{branch}"),
+            "-T",
+            "description ++ \"\n\"",
+        ],
+    )?;
+    let commit_descriptions = commit_descriptions.trim().to_owned();
+
+    let mut template = if count == 1 {
+        commit_descriptions.clone()
+    } else {
+        format!("Enter PR title...\n\n{body}")
+    };
+    writeln!(&mut template)?;
+    writeln!(&mut template)?;
+    writeln!(&mut template, "JJ: {ignored_marker}")?;
+    if count != 1 {
+        writeln!(&mut template)?;
+        write!(&mut template, "{commit_descriptions}")?;
+    }
+    if !diff.trim().is_empty() {
+        writeln!(&mut template)?;
+        writeln!(&mut template)?;
+        writeln!(&mut template, "{diff}")?;
+    }
+
+    if let Some(text) = Editor::new().extension(".jjdescription").edit(&template)? {
         if text.trim().is_empty() {
             bail!("empty PR title and description");
         }

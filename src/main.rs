@@ -94,6 +94,7 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
                     &repo_info,
                     &octocrab,
                     &mut pulls,
+                    true,
                 )
                 .await
                 .context("failed to sync prs")?;
@@ -300,14 +301,19 @@ async fn find_or_create_prs(
     repo_info: &RepoInfo,
     octocrab: &Octocrab,
     pulls: &mut Vec<PullRequest>,
+    is_first: bool,
 ) -> color_eyre::Result<()> {
+    if !is_first {
+        println!();
+    }
+
     find_or_create_pr(target, branch, pulls, octocrab, repo_info)
         .await
         .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;
 
     for child in graph.iter_edges_from(branch) {
         Box::pin(find_or_create_prs(
-            child, branch, graph, repo_info, octocrab, pulls,
+            child, branch, graph, repo_info, octocrab, pulls, false,
         ))
         .await
         .with_context(|| format!("failed to find or create pr from {branch} into {target}"))?;

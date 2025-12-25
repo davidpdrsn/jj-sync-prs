@@ -374,33 +374,38 @@ async fn find_or_create_pr(
                 })?;
             pulls[idx] = updated;
         }
-    } else if Confirm::new()
-        .with_prompt(format!(
-            "PR from {target} <- {branch} doesn't exist. Do you want to create it?"
-        ))
-        .default(true)
-        .interact()?
-    {
-        let repo_pulls = octocrab.pulls(&repo_info.owner, &repo_info.name);
-
-        let pull = if let Some((title, body)) = get_pr_title_and_body(branch, target)? {
-            repo_pulls.create(title, branch, target).body(body)
-        } else {
-            repo_pulls.create(branch, branch, target)
-        }
-        .draft(true)
-        .send()
-        .await
-        .with_context(|| format!("failed to create PR from {target} <- {branch}"))?;
-
-        if let Some(url) = &pull.html_url {
-            eprintln!("Created PR from {target} <- {branch}: {url}");
-        } else {
-            eprintln!("Created PR from {target} <- {branch}");
-        }
-        pulls.push(pull);
     } else {
-        eprintln!("skipping creating PR from {target} <- {branch}");
+        let mut command = std::process::Command::new("jj");
+        command.args(["log", "-r", &format!("{target}::{branch}")]);
+        command.spawn()?.wait()?;
+        if Confirm::new()
+            .with_prompt(format!(
+                "PR from {target} <- {branch} doesn't exist. Do you want to create it?"
+            ))
+            .default(true)
+            .interact()?
+        {
+            let repo_pulls = octocrab.pulls(&repo_info.owner, &repo_info.name);
+
+            let pull = if let Some((title, body)) = get_pr_title_and_body(branch, target)? {
+                repo_pulls.create(title, branch, target).body(body)
+            } else {
+                repo_pulls.create(branch, branch, target)
+            }
+            .draft(true)
+            .send()
+            .await
+            .with_context(|| format!("failed to create PR from {target} <- {branch}"))?;
+
+            if let Some(url) = &pull.html_url {
+                eprintln!("Created PR from {target} <- {branch}: {url}");
+            } else {
+                eprintln!("Created PR from {target} <- {branch}");
+            }
+            pulls.push(pull);
+        } else {
+            eprintln!("skipping creating PR from {target} <- {branch}");
+        }
     }
 
     Ok(())
@@ -494,6 +499,19 @@ fn get_pr_title_and_body(
     let body = std::fs::read_to_string(".github/pull_request_template.md")
         .unwrap_or_else(|_| "...and description here".to_owned());
 
+    let log = command(
+        "jj",
+        [
+            "log",
+            "--color",
+            "never",
+            "-r",
+            &format!("{target}..{branch}"),
+            "-T",
+            "builtin_log_detailed",
+        ],
+    )?;
+
     let diff = command(
         "jj",
         ["diff", "--git", "-r", &format!("{target}..{branch}")],
@@ -529,13 +547,9 @@ fn get_pr_title_and_body(
     writeln!(&mut template)?;
     writeln!(&mut template)?;
     writeln!(&mut template, "JJ: {ignored_marker}")?;
-    if count != 1 {
-        writeln!(&mut template)?;
-        write!(&mut template, "{commit_descriptions}")?;
-    }
+    writeln!(&mut template)?;
+    writeln!(&mut template, "{log}")?;
     if !diff.trim().is_empty() {
-        writeln!(&mut template)?;
-        writeln!(&mut template)?;
         writeln!(&mut template, "{diff}")?;
     }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -496,66 +497,133 @@ async fn create_or_update_comment(
     Ok(())
 }
 
+struct GetPrTitleAndBody {
+    title: Option<Cow<'static, str>>,
+    message: Option<Cow<'static, str>>,
+    additional: Option<String>,
+    diff: Option<String>,
+    log: String,
+}
+
+impl GetPrTitleAndBody {
+    fn get(branch: &str, target: &str) -> color_eyre::Result<Self> {
+        let title: Option<Cow<'static, str>>;
+        let message: Option<Cow<'static, str>>;
+        let additional: Option<String>;
+
+        let count = command(
+            "jj",
+            ["log", "--count", "-r", &format!("{target}..{branch}")],
+        )?
+        .trim()
+        .parse::<i32>()?;
+
+        let descriptions = command(
+            "jj",
+            [
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("{target}..{branch}"),
+                "-T",
+                "description ++ \"\n\"",
+            ],
+        )?;
+        let mut descriptions_lines = descriptions.lines();
+
+        if let Ok(pr_template) = std::fs::read_to_string(".github/pull_request_template.md") {
+            title = if count == 1 {
+                descriptions_lines.next().map(|line| line.to_owned().into())
+            } else {
+                None
+            };
+            message = Some(pr_template.into());
+            additional = Some(descriptions_lines.collect::<Vec<_>>().join("\n"));
+        } else if count == 1 {
+            title = descriptions_lines.next().map(|line| line.to_owned().into());
+            message = Some(descriptions_lines.collect::<Vec<_>>().join("\n").into());
+            additional = None;
+        } else {
+            title = None;
+            message = None;
+            additional = Some(descriptions);
+        }
+
+        let diff = command(
+            "jj",
+            ["diff", "--git", "-r", &format!("{target}..{branch}")],
+        )?;
+        let diff = if diff.trim().is_empty() {
+            None
+        } else {
+            Some(diff)
+        };
+
+        let log = command(
+            "jj",
+            [
+                "log",
+                "--color",
+                "never",
+                "-r",
+                &format!("{target}..{branch}"),
+                "-T",
+                "builtin_log_detailed",
+            ],
+        )?;
+
+        Ok(GetPrTitleAndBody {
+            title,
+            message,
+            additional,
+            diff,
+            log,
+        })
+    }
+}
+
+const IGNORED_MARKER: &str = "Everything below this line will be ignored";
+
 fn get_pr_title_and_body(
     branch: &str,
     target: &str,
 ) -> color_eyre::Result<Option<(String, String)>> {
     use std::fmt::Write;
 
-    let body = std::fs::read_to_string(".github/pull_request_template.md")
-        .unwrap_or_else(|_| "...and description here".to_owned());
+    let mut template = String::new();
 
-    let log = command(
-        "jj",
-        [
-            "log",
-            "--color",
-            "never",
-            "-r",
-            &format!("{target}..{branch}"),
-            "-T",
-            "builtin_log_detailed",
-        ],
-    )?;
+    let GetPrTitleAndBody {
+        title,
+        message,
+        additional,
+        diff,
+        log,
+    } = GetPrTitleAndBody::get(branch, target)?;
 
-    let diff = command(
-        "jj",
-        ["diff", "--git", "-r", &format!("{target}..{branch}")],
-    )?;
-
-    let count = command(
-        "jj",
-        ["log", "--count", "-r", &format!("{target}..{branch}")],
-    )?
-    .trim()
-    .parse::<i32>()?;
-
-    let ignored_marker = "Everything below this line will be ignored";
-
-    let commit_descriptions = command(
-        "jj",
-        [
-            "log",
-            "--no-graph",
-            "-r",
-            &format!("{target}..{branch}"),
-            "-T",
-            "description ++ \"\n\"",
-        ],
-    )?;
-    let commit_descriptions = commit_descriptions.trim().to_owned();
-
-    let mut template = if count == 1 {
-        commit_descriptions.clone()
+    if let Some(title) = title {
+        writeln!(&mut template, "{title}")?;
+        writeln!(&mut template)?;
     } else {
-        format!("Enter PR title...\n\n{body}")
-    };
+        writeln!(&mut template, "Enter PR title...")?;
+        writeln!(&mut template)?;
+    }
+
+    if let Some(message) = message {
+        writeln!(&mut template, "{message}")?;
+        writeln!(&mut template)?;
+    }
+
+    writeln!(&mut template, "JJ: {IGNORED_MARKER}")?;
     writeln!(&mut template)?;
-    writeln!(&mut template)?;
-    writeln!(&mut template, "JJ: {ignored_marker}")?;
-    writeln!(&mut template)?;
+
     writeln!(&mut template, "{log}")?;
-    if !diff.trim().is_empty() {
+
+    if let Some(additional) = additional {
+        writeln!(&mut template, "{additional}")?;
+        writeln!(&mut template)?;
+    }
+
+    if let Some(diff) = diff {
         writeln!(&mut template, "{diff}")?;
     }
 
@@ -570,7 +638,7 @@ fn get_pr_title_and_body(
         };
         let msg = lines
             .skip(1)
-            .take_while(|line| !line.contains(ignored_marker))
+            .take_while(|line| !line.contains(IGNORED_MARKER))
             .collect::<Vec<_>>()
             .join("\n");
         Ok(Some((title.to_owned(), msg)))

@@ -79,10 +79,11 @@ async fn main() -> color_eyre::Result<()> {
 async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
     match subcommand {
         Subcommand::Sync { github_token } => {
-            let branch_at_root_of_stack = branch_at_root_of_stack();
+            let branch_at_root_of_stack = branch_at_root_of_stack()?;
+            let graph_branch_root = branch_at_root_of_stack.clone();
 
-            let graph = tokio::task::spawn_blocking(|| {
-                build_branch_graph(branch_at_root_of_stack).context("failed to build graph")
+            let graph = tokio::task::spawn_blocking(move || {
+                build_branch_graph(&graph_branch_root).context("failed to build graph")
             });
 
             let repo_info = repo_info().context("failed to find repo info")?;
@@ -102,10 +103,10 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
 
             let graph = graph.await??;
 
-            for stack_root in graph.iter_edges_from(branch_at_root_of_stack) {
+            for stack_root in graph.iter_edges_from(&branch_at_root_of_stack) {
                 find_or_create_prs(
                     stack_root,
-                    branch_at_root_of_stack,
+                    &branch_at_root_of_stack,
                     &graph,
                     github.as_ref(),
                     &mut pulls,
@@ -117,7 +118,7 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1024);
 
-            for stack_root in graph.iter_edges_from(branch_at_root_of_stack) {
+            for stack_root in graph.iter_edges_from(&branch_at_root_of_stack) {
                 let mut comment_lines = Vec::new();
                 write_pr_comment(&graph, stack_root, 0, &mut comment_lines);
 
@@ -139,9 +140,9 @@ async fn run_subcommand(subcommand: Subcommand) -> color_eyre::Result<()> {
             while rx.recv().await.is_some() {}
         }
         Subcommand::Graph { out } => {
-            let branch_at_root_of_stack = branch_at_root_of_stack();
+            let branch_at_root_of_stack = branch_at_root_of_stack()?;
             let graph =
-                build_branch_graph(branch_at_root_of_stack).context("failed to build graph")?;
+                build_branch_graph(&branch_at_root_of_stack).context("failed to build graph")?;
             let dot = graph.to_dot();
             let (read, mut write) = std::io::pipe()?;
             let out = out.as_deref().unwrap_or_else(|| Path::new("branches.png"));
@@ -240,12 +241,38 @@ fn repo_info() -> color_eyre::Result<RepoInfo> {
     parse_repo_info_output(&output)
 }
 
-fn branch_at_root_of_stack() -> &'static str {
-    if command("jj", ["show", "dev"]).is_ok() {
-        "dev"
+fn parse_trunk_bookmark_output(output: &str) -> Option<String> {
+    let mut names = output
+        .split_whitespace()
+        .map(|name| name.trim_matches('*').trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+
+    names.dedup();
+
+    if names.len() == 1 {
+        Some(names[0].to_owned())
     } else {
-        "main"
+        None
     }
+}
+
+fn branch_at_root_of_stack() -> color_eyre::Result<String> {
+    if let Ok(output) = command("jj", ["show", "-r", "trunk()", "-T", "local_bookmarks"]) {
+        if let Some(branch) = parse_trunk_bookmark_output(&output) {
+            return Ok(branch);
+        }
+    }
+
+    if command("jj", ["show", "main"]).is_ok() {
+        return Ok("main".to_owned());
+    }
+
+    if command("jj", ["show", "master"]).is_ok() {
+        return Ok("master".to_owned());
+    }
+
+    Ok("main".to_owned())
 }
 
 fn command<I>(command: &str, args: I) -> color_eyre::Result<String>
@@ -999,27 +1026,38 @@ mod tests {
     }
 
     #[test]
-    fn branch_at_root_of_stack_prefers_dev_when_present() {
-        let _guard = install_hooks(TestHooks {
-            command: Some(Arc::new(|command, args| {
-                if command == "jj" && args == ["show".to_string(), "dev".to_string()] {
-                    Ok("ok".to_owned())
-                } else {
-                    bail!("unexpected command: {command} {args:?}")
-                }
-            })),
-            ..Default::default()
-        });
-
-        assert_eq!(branch_at_root_of_stack(), "dev");
+    fn parse_trunk_bookmark_output_parses_single_bookmark() {
+        assert_eq!(parse_trunk_bookmark_output("master\n"), Some("master".to_owned()));
     }
 
     #[test]
-    fn branch_at_root_of_stack_falls_back_to_main() {
+    fn parse_trunk_bookmark_output_ignores_markers_and_whitespace() {
+        assert_eq!(
+            parse_trunk_bookmark_output("  *main  \n"),
+            Some("main".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_trunk_bookmark_output_rejects_ambiguous_output() {
+        assert_eq!(parse_trunk_bookmark_output("main master\n"), None);
+    }
+
+    #[test]
+    fn branch_at_root_of_stack_uses_trunk_bookmark() -> color_eyre::Result<()> {
         let _guard = install_hooks(TestHooks {
             command: Some(Arc::new(|command, args| {
-                if command == "jj" && args == ["show".to_string(), "dev".to_string()] {
-                    bail!("missing")
+                if command == "jj"
+                    && args
+                        == [
+                            "show".to_string(),
+                            "-r".to_string(),
+                            "trunk()".to_string(),
+                            "-T".to_string(),
+                            "local_bookmarks".to_string(),
+                        ]
+                {
+                    Ok("master\n".to_owned())
                 } else {
                     bail!("unexpected command: {command} {args:?}")
                 }
@@ -1027,7 +1065,83 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(branch_at_root_of_stack(), "main");
+        assert_eq!(branch_at_root_of_stack()?, "master");
+        Ok(())
+    }
+
+    #[test]
+    fn branch_at_root_of_stack_falls_back_to_master_when_trunk_is_unavailable(
+    ) -> color_eyre::Result<()> {
+        let _guard = install_hooks(TestHooks {
+            command: Some(Arc::new(|command, args| {
+                if command != "jj" {
+                    bail!("unexpected command: {command} {args:?}");
+                }
+
+                if args
+                    == [
+                        "show".to_string(),
+                        "-r".to_string(),
+                        "trunk()".to_string(),
+                        "-T".to_string(),
+                        "local_bookmarks".to_string(),
+                    ]
+                {
+                    bail!("trunk unavailable");
+                }
+
+                if args == ["show".to_string(), "main".to_string()] {
+                    bail!("main missing");
+                }
+
+                if args == ["show".to_string(), "master".to_string()] {
+                    return Ok("ok".to_owned());
+                }
+
+                bail!("unexpected command: {command} {args:?}")
+            })),
+            ..Default::default()
+        });
+
+        assert_eq!(branch_at_root_of_stack()?, "master");
+        Ok(())
+    }
+
+    #[test]
+    fn branch_at_root_of_stack_falls_back_to_main() -> color_eyre::Result<()> {
+        let _guard = install_hooks(TestHooks {
+            command: Some(Arc::new(|command, args| {
+                if command != "jj" {
+                    bail!("unexpected command: {command} {args:?}");
+                }
+
+                if args
+                    == [
+                        "show".to_string(),
+                        "-r".to_string(),
+                        "trunk()".to_string(),
+                        "-T".to_string(),
+                        "local_bookmarks".to_string(),
+                    ]
+                {
+                    return Ok("\n".to_owned());
+                }
+
+                if args == ["show".to_string(), "main".to_string()] {
+                    bail!("main missing");
+                }
+
+                if args == ["show".to_string(), "master".to_string()] {
+                    bail!("master missing");
+                }
+
+                bail!("unexpected command: {command} {args:?}")
+            })),
+            ..Default::default()
+        });
+
+        assert_eq!(branch_at_root_of_stack()?, "main");
+        Ok(())
     }
 
     #[test]
